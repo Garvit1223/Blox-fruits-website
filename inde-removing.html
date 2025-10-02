@@ -2214,13 +2214,11 @@
         });
 </script>
 <script type="module">
-  // Firebase (aliased to avoid any name clashes)
   import * as FBAPP from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
   import * as FBRDB from "https://www.gstatic.com/firebasejs/10.13.2/firebase-database.js";
   import * as FBAUTH from "https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js";
 
   window.addEventListener("DOMContentLoaded", () => {
-    // --- Your Firebase config ---
     const CONFIG = {
       apiKey: "AIzaSyA2jFJw_sfIYBIzHGRF9mZXJa5PrjvE1e8",
       authDomain: "the-kira-brothers.firebaseapp.com",
@@ -2231,15 +2229,20 @@
       appId: "1:602050385907:web:c7971be88c312d4052a486"
     };
 
-    // Init (unique app name so it won't collide)
+    // Init (unique name to avoid clashes)
     const APP_NAME = "kb-owned-app";
     const app = FBAPP.getApps().find(a => a.name === APP_NAME) || FBAPP.initializeApp(CONFIG, APP_NAME);
     const db  = FBRDB.getDatabase(app);
     const auth = FBAUTH.getAuth(app);
-    FBAUTH.signInAnonymously(auth).catch(() => {}); // ok if rules are public while testing
+    FBAUTH.signInAnonymously(auth).catch(() => {}); // fine if rules allow public read/write
 
-    // Helpers
+    // ---------- helpers ----------
     const $ = id => document.getElementById(id);
+    const norm = v => (v ?? "").toString().trim().toLowerCase();
+    const onlyNum = v => (v ?? "").toString().replace(/[^0-9.]/g, "");
+    const makeSig = ({ name, gameValue, realValue, rarity, demand }) =>
+      `${norm(name)}|${Number(gameValue)||0}|${Number(realValue)||0}|${norm(rarity)}|${Number(demand)||0}`;
+
     const toDataURL = file => new Promise(res => {
       if (!file) return res(null);
       const r = new FileReader();
@@ -2247,11 +2250,8 @@
       r.onerror = () => res(null);
       r.readAsDataURL(file);
     });
-    const norm = v => (v ?? "").toString().trim().toLowerCase();
-    const makeSig = ({ name, gameValue, realValue, rarity, demand }) =>
-      `${norm(name)}|${Number(gameValue)||0}|${Number(realValue)||0}|${norm(rarity)}|${Number(demand)||0}`;
 
-    // --- 1) ADD: when the form submits, also write to DB (keeps your current UI code untouched) ---
+    // ---------- SAVE (runs alongside your local UI handler) ----------
     const form = $("itemForm");
     form?.addEventListener("submit", async () => {
       const name    = $("itemName")?.value || "";
@@ -2262,7 +2262,6 @@
       const file    = $("itemImage")?.files?.[0] || null;
       const image   = await toDataURL(file);
 
-      // your local code already validates; we skip DB write if required fields missing
       if (!name || !gameVal || !realVal || !rarity) return;
 
       const sig = makeSig({ name, gameValue: gameVal, realValue: realVal, rarity, demand });
@@ -2273,56 +2272,82 @@
         rarity,
         demand: Number(demand),
         imageDataURL: image || null,
-        sig,                 // <-- signature to find the exact record later
-        createdAt: Date.now()
+        sig,
+        createdAt: Date.now(),
+        uid: auth.currentUser?.uid || null
       };
 
       const newRef = FBRDB.push(FBRDB.ref(db, "items"));
       await FBRDB.set(newRef, payload);
-      console.log("✅ Saved to Realtime DB:", newRef.key);
+      console.log("✅ Saved to Realtime DB:", newRef.key, "sig:", sig);
     }, { capture: true });
 
-    // --- 2) DELETE: catch clicks on the "Remove Item" buttons and remove matching DB record ---
-    document.addEventListener("click", async (e) => {
-      const btn = e.target.closest("button.delete-btn");
-      if (!btn) return;
-
-      // Optional safety: only the owner should delete from DB (your UI already enforces this)
-      if (!document.body.classList.contains("owner-mode")) return;
-
-      const card = btn.closest(".item-card");
-      if (!card) return;
-
-      // read values from the card your renderer outputs
-      const name      = card.querySelector(".item-name")?.textContent || "";
-      const rarityTxt = card.querySelector(".rarity-badge")?.textContent || "";
-      const gameTxt   = card.querySelector(".game-value")?.textContent || "";   // like "$8000000"
-      const realTxt   = card.querySelector(".real-value")?.textContent || "";   // like "$240000000"
-      const demandTxt = card.querySelector(".demand-value")?.textContent || ""; // like "10/10"
-
-      const gameVal = gameTxt.replace(/[^0-9.]/g, "");
-      const realVal = realTxt.replace(/[^0-9.]/g, "");
-      const demand  = (demandTxt.split("/")[0] || "").replace(/[^0-9]/g, "");
-      const rarity  = rarityTxt.toLowerCase();
-      const sig     = makeSig({ name, gameValue: gameVal, realValue: realVal, rarity, demand });
-
+    // ---------- DELETE (fast by sig; fallback to scan) ----------
+    async function removeBySigOrScan(sig) {
+      // Try indexed query first
       try {
-        // Look up the DB record by its signature and delete it
         const q = FBRDB.query(
           FBRDB.ref(db, "items"),
           FBRDB.orderByChild("sig"),
           FBRDB.equalTo(sig)
         );
         const snap = await FBRDB.get(q);
-
         if (snap.exists()) {
-          // delete all matches (usually just one)
           const updates = {};
           snap.forEach(child => { updates[child.key] = null; });
           await FBRDB.update(FBRDB.ref(db, "items"), updates);
-          console.log("🗑️ Removed from Realtime DB:", Object.keys(updates));
-        } else {
-          console.warn("No matching DB item found for deletion (sig:", sig, ")");
+          console.log("🗑️ Removed from DB (indexed):", Object.keys(updates));
+          return true;
+        }
+      } catch (e) {
+        // likely: index not defined; fall through to scan
+      }
+
+      // Fallback: scan all children and match by sig (no index needed)
+      const all = await FBRDB.get(FBRDB.ref(db, "items"));
+      if (!all.exists()) return false;
+      const updates = {};
+      all.forEach(child => {
+        const v = child.val();
+        const childSig = v?.sig ?? makeSig({
+          name: v?.name, gameValue: v?.gameValue, realValue: v?.realValue,
+          rarity: v?.rarity, demand: v?.demand
+        });
+        if (childSig === sig) updates[child.key] = null;
+      });
+      if (Object.keys(updates).length) {
+        await FBRDB.update(FBRDB.ref(db, "items"), updates);
+        console.log("🗑️ Removed from DB (scan):", Object.keys(updates));
+        return true;
+      }
+      return false;
+    }
+
+    // Listen for clicks on your existing "Remove Item" buttons
+    document.addEventListener("click", async (e) => {
+      const btn = e.target.closest("button.delete-btn");
+      if (!btn) return;
+
+      const card = btn.closest(".item-card");
+      if (!card) return;
+
+      // Pull values out of the card DOM your UI renders
+      const name      = card.querySelector(".item-name")?.textContent || "";
+      const rarityTxt = card.querySelector(".rarity-badge")?.textContent || "";
+      const gameTxt   = card.querySelector(".game-value")?.textContent || "";
+      const realTxt   = card.querySelector(".real-value")?.textContent || "";
+      const demandTxt = card.querySelector(".demand-value")?.textContent || ""; // e.g. "10/10"
+
+      const gameVal = onlyNum(gameTxt);
+      const realVal = onlyNum(realTxt);
+      const demand  = onlyNum(demandTxt.split("/")[0]);
+      const rarity  = norm(rarityTxt);
+      const sig     = makeSig({ name, gameValue: gameVal, realValue: realVal, rarity, demand });
+
+      try {
+        const ok = await removeBySigOrScan(sig);
+        if (!ok) {
+          console.warn("⚠️ No matching DB item found for deletion (sig:", sig, ")");
         }
       } catch (err) {
         console.error("❌ DB delete failed:", err);
@@ -2330,13 +2355,13 @@
     }, { capture: true });
   });
 </script>
+
 <script type="module">
   import * as FBAPP from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
   import * as FBRDB from "https://www.gstatic.com/firebasejs/10.13.2/firebase-database.js";
   import * as FBAUTH from "https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js";
 
   window.addEventListener("DOMContentLoaded", () => {
-    // --- Firebase init (same project you used for writing) ---
     const CONFIG = {
       apiKey: "AIzaSyA2jFJw_sfIYBIzHGRF9mZXJa5PrjvE1e8",
       authDomain: "the-kira-brothers.firebaseapp.com",
@@ -2351,58 +2376,57 @@
     const app = FBAPP.getApps().find(a => a.name === APP_NAME) || FBAPP.initializeApp(CONFIG, APP_NAME);
     const db  = FBRDB.getDatabase(app);
     const auth = FBAUTH.getAuth(app);
-    FBAUTH.signInAnonymously(auth).catch(() => {}); // fine if your rules allow public read
+    FBAUTH.signInAnonymously(auth).catch(()=>{}); // ok if using public read rules
 
-    // --- Render helpers (simple card; adjust classes if your CSS differs) ---
     const wrap = document.getElementById("itemsContainer");
     const empty = document.getElementById("emptyState");
-    const setEmpty = (x)=> { if (empty) empty.style.display = x ? "block" : "none"; };
+    const setEmpty = s => { if (empty) empty.style.display = s ? "block" : "none"; };
 
-    function renderCard(key, d) {
+    // optional: clear whatever the local renderer put there so DB is source of truth
+    if (wrap) wrap.innerHTML = "";
+
+    function cardHTML(d){
+      const img = d.imageURL || d.imageDataURL;
+      const demand = Math.min(10, Math.max(1, Number(d.demand)||1));
+      return `
+        <div class="item-image">
+          ${img ? `<img class="card-img" src="${img}" alt="${d.name||'Item'}">` : `<div class="empty-image-box">🖼️</div>`}
+        </div>
+        <span class="rarity-badge ${d.rarity||'common'}">${(d.rarity||'common').toUpperCase()}</span>
+        <div class="item-name">${d.name||'Unnamed Item'}</div>
+        <div class="item-details">
+          <div class="detail-item"><div class="detail-label">Game Value</div><div class="detail-value game-value">$${d.gameValue ?? '-'}</div></div>
+          <div class="detail-item"><div class="detail-label">Real Value ($)</div><div class="detail-value real-value">$${d.realValue ?? '-'}</div></div>
+        </div>
+        <div class="demand-bar"><div class="demand-fill" style="width:${demand*10}%"></div></div>
+        <div class="demand-value" style="text-align:center;margin-top:6px;">${demand}/10</div>
+      `;
+    }
+
+    function renderDBCard(key, d){
       if (!wrap) return;
       if (document.getElementById(`db-${key}`)) return; // avoid duplicates
-
       const card = document.createElement("div");
       card.id = `db-${key}`;
-      card.className = `item-card from-db ${d.rarity || "common"}`;
-
-      const imgHtml = d.imageURL || d.imageDataURL
-        ? `<img class="card-img" src="${d.imageURL || d.imageDataURL}" alt="${d.name || "Item"}">`
-        : `<div class="empty-image-box">🖼️</div>`;
-
-      card.innerHTML = `
-        <div class="item-image">${imgHtml}</div>
-        <span class="rarity-badge ${d.rarity || "common"}">${(d.rarity || "common").toUpperCase()}</span>
-        <div class="item-name">${d.name || "Unnamed Item"}</div>
-
-        <div class="item-details">
-          <div class="detail-item"><div class="detail-label">Game Value</div>
-            <div class="detail-value game-value">$${d.gameValue ?? "-"}</div></div>
-          <div class="detail-item"><div class="detail-label">Real Value ($)</div>
-            <div class="detail-value real-value">$${d.realValue ?? "-"}</div></div>
-        </div>
-
-        <div class="demand-bar"><div class="demand-fill" style="width:${Math.min(10, Math.max(1, Number(d.demand)||1))*10}%"></div></div>
-        <div class="demand-value" style="text-align:center;margin-top:6px;">${d.demand || 1}/10</div>
-      `;
-
+      card.className = `item-card from-db ${d.rarity||'common'}`;
+      card.innerHTML = cardHTML(d);
       wrap.prepend(card);
     }
 
-    // --- Live sync from Realtime Database ---
     const itemsRef = FBRDB.ref(db, "items");
     let count = 0; setEmpty(true);
 
-    FBRDB.onChildAdded(itemsRef, (snap) => {
-      count++; setEmpty(count === 0);
-      renderCard(snap.key, snap.val());
+    FBRDB.onChildAdded(itemsRef, snap => {
+      count++; setEmpty(count===0);
+      renderDBCard(snap.key, snap.val());
     });
 
-    FBRDB.onChildRemoved(itemsRef, (snap) => {
-      count = Math.max(0, count - 1); setEmpty(count === 0);
+    FBRDB.onChildRemoved(itemsRef, snap => {
+      count = Math.max(0, count-1); setEmpty(count===0);
       document.getElementById(`db-${snap.key}`)?.remove();
     });
   });
 </script>
+
 <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'98739acb61d0a75d',t:'MTc1OTIzNDA5Ni4wMDAwMDA='};var a=document.createElement('script');a.nonce='';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
